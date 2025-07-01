@@ -78,12 +78,17 @@ async def register_user(user: User):
 @app.post("/login")
 async def login_user(user: User):
     cursor.execute(
-        'SELECT username FROM users WHERE username = ? AND password = ?',
-        (user.username, user.password)
+        'SELECT username, password FROM users WHERE username = ?', (user.username,)
     )
-    if cursor.fetchone() is None:
+    db_user = cursor.fetchone()
+    if db_user is None:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    return {"success": True}
+
+    stored_username, stored_password = db_user
+    if user.username == stored_username and pwd_context.verify(user.password, stored_password):
+        return {"success": True}
+    else:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
 @app.post("/send_message")
 async def send_message(message: Message):
