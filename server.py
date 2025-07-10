@@ -1,17 +1,25 @@
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
 import sqlite3
 from passlib.context import CryptContext
-from typing import List, Optional
+from typing import List, Optional, Dict
+import json
+import asyncio
 
 app = FastAPI()
 
-# Database setup
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 conn = sqlite3.connect('messenger.db', check_same_thread=False)
 cursor = conn.cursor()
-
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY,
@@ -21,7 +29,6 @@ cursor.execute('''
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
 ''')
-
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY,
@@ -32,20 +39,18 @@ cursor.execute('''
         is_read BOOLEAN DEFAULT FALSE
     )
 ''')
-
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS friends (
         id INTEGER PRIMARY KEY,
         user1 TEXT NOT NULL,
         user2 TEXT NOT NULL,
-        status TEXT DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        status TEXT DEFAULT 'accepted',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user1, user2)
     )
 ''')
-
 conn.commit()
 
-# Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 class User(BaseModel):
@@ -61,6 +66,15 @@ class Message(BaseModel):
 class FriendRequest(BaseModel):
     user1: str
     user2: str
+
+class EditMessage(BaseModel):
+    message_id: int
+    new_message: str
+
+class DeleteMessage(BaseModel):
+    message_id: int
+
+online_users: Dict[str, WebSocket] = {}
 
 @app.post("/register")
 async def register_user(user: User):
@@ -78,17 +92,13 @@ async def register_user(user: User):
 @app.post("/login")
 async def login_user(user: User):
     cursor.execute(
-        'SELECT username, password FROM users WHERE username = ?', (user.username,)
+        'SELECT password FROM users WHERE username = ?',
+        (user.username,)
     )
-    db_user = cursor.fetchone()
-    if db_user is None:
+    result = cursor.fetchone()
+    if result is None or not pwd_context.verify(user.password, result[0]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    stored_username, stored_password = db_user
-    if user.username == stored_username and pwd_context.verify(user.password, stored_password):
-        return {"success": True}
-    else:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    return {"success": True, "username": user.username}
 
 @app.post("/send_message")
 async def send_message(message: Message):
@@ -97,12 +107,77 @@ async def send_message(message: Message):
         (message.sender, message.receiver, message.message)
     )
     conn.commit()
+    cursor.execute(
+        'SELECT id, timestamp FROM messages WHERE sender = ? AND receiver = ? ORDER BY id DESC LIMIT 1',
+        (message.sender, message.receiver)
+    )
+    result = cursor.fetchone()
+    if result:
+        message_id, timestamp = result
+        enriched_message = {
+            "action": "message",
+            "id": message_id,
+            "sender": message.sender,
+            "receiver": message.receiver,
+            "message": message.message,
+            "timestamp": timestamp
+        }
+        for user in [message.sender, message.receiver]:
+            if user in online_users:
+                await online_users[user].send_text(json.dumps(enriched_message))
+    return {"success": True}
+
+@app.post("/edit_message")
+async def edit_message(edit_message: EditMessage):
+    cursor.execute(
+        'UPDATE messages SET message = ? WHERE id = ?',
+        (edit_message.new_message, edit_message.message_id)
+    )
+    conn.commit()
+    cursor.execute(
+        'SELECT sender, receiver FROM messages WHERE id = ?',
+        (edit_message.message_id,)
+    )
+    result = cursor.fetchone()
+    if result:
+        sender, receiver = result
+        enriched_message = {
+            "action": "edit_message",
+            "id": edit_message.message_id,
+            "new_message": edit_message.new_message
+        }
+        for user in [sender, receiver]:
+            if user in online_users:
+                await online_users[user].send_text(json.dumps(enriched_message))
+    return {"success": True}
+
+@app.post("/delete_message")
+async def delete_message(delete_message: DeleteMessage):
+    cursor.execute(
+        'SELECT sender, receiver FROM messages WHERE id = ?',
+        (delete_message.message_id,)
+    )
+    result = cursor.fetchone()
+    if result:
+        sender, receiver = result
+        cursor.execute(
+            'DELETE FROM messages WHERE id = ?',
+            (delete_message.message_id,)
+        )
+        conn.commit()
+        enriched_message = {
+            "action": "delete_message",
+            "id": delete_message.message_id
+        }
+        for user in [sender, receiver]:
+            if user in online_users:
+                await online_users[user].send_text(json.dumps(enriched_message))
     return {"success": True}
 
 @app.get("/get_chat_history/{user1}/{user2}")
 async def get_chat_history(user1: str, user2: str, limit: int = 50):
     cursor.execute('''
-        SELECT sender, receiver, message, timestamp
+        SELECT id, sender, receiver, message, timestamp
         FROM messages
         WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
         ORDER BY timestamp DESC LIMIT ?
@@ -110,21 +185,50 @@ async def get_chat_history(user1: str, user2: str, limit: int = 50):
     messages = []
     for row in reversed(cursor.fetchall()):
         messages.append({
-            'sender': row[0],
-            'receiver': row[1],
-            'message': row[2],
-            'timestamp': row[3]
+            'id': row[0],
+            'sender': row[1],
+            'receiver': row[2],
+            'message': row[3],
+            'timestamp': row[4]
         })
     return {"messages": messages}
 
 @app.post("/add_friend")
 async def add_friend(friend_request: FriendRequest):
     try:
+        cursor.execute('SELECT username FROM users WHERE username IN (?, ?)', 
+                      (friend_request.user1, friend_request.user2))
+        existing_users = set(row[0] for row in cursor.fetchall())
+        if friend_request.user1 not in existing_users or friend_request.user2 not in existing_users:
+            raise HTTPException(status_code=400, detail="One or both users do not exist")
+        
         cursor.execute(
-            'INSERT INTO friends (user1, user2, status) VALUES (?, ?, ?)',
+            'INSERT OR IGNORE INTO friends (user1, user2, status) VALUES (?, ?, ?)',
             (friend_request.user1, friend_request.user2, 'accepted')
         )
+        cursor.execute(
+            'INSERT OR IGNORE INTO friends (user1, user2, status) VALUES (?, ?, ?)',
+            (friend_request.user2, friend_request.user1, 'accepted')
+        )
         conn.commit()
+        
+        for user in [friend_request.user1, friend_request.user2]:
+            if user in online_users:
+                cursor.execute(
+                    '''
+                    SELECT CASE
+                        WHEN user1 = ? THEN user2
+                        ELSE user1
+                    END as friend
+                    FROM friends
+                    WHERE (user1 = ? OR user2 = ?) AND status = 'accepted'
+                    ''', (user, user, user)
+                )
+                friends = [row[0] for row in cursor.fetchall()]
+                await online_users[user].send_text(json.dumps({
+                    "action": "friends_update",
+                    "friends": friends
+                }))
         return {"success": True}
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="Friend request already exists")
@@ -147,7 +251,116 @@ async def get_user_friends(username: str):
         FROM friends
         WHERE (user1 = ? OR user2 = ?) AND status = 'accepted'
     ''', (username, username, username))
-    return {"friends": [row[0] for row in cursor.fetchall()]}
+    friends = [row[0] for row in cursor.fetchall()]
+
+    friends_with_status = [{"username": friend, "status": "online" if friend in online_users else "offline"} 
+                          for friend in friends]
+    return {"friends": friends_with_status}
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    await websocket.accept()
+    online_users[user_id] = websocket
+    
+    cursor.execute(
+        '''
+        SELECT CASE
+            WHEN user1 = ? THEN user2
+            ELSE user1
+        END as friend
+        FROM friends
+        WHERE (user1 = ? OR user2 = ?) AND status = 'accepted'
+        ''', (user_id, user_id, user_id)
+    )
+    friends = [row[0] for row in cursor.fetchall()]
+    
+    status_message = {
+        "action": "user_status",
+        "user": user_id,
+        "status": "online"
+    }
+    for friend in friends:
+        if friend in online_users:
+            await online_users[friend].send_text(json.dumps(status_message))
+    
+    try:
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            if message["action"] == "message":
+                cursor.execute(
+                    'INSERT INTO messages (sender, receiver, message) VALUES (?, ?, ?)',
+                    (message["sender"], message["receiver"], message["message"])
+                )
+                conn.commit()
+                cursor.execute(
+                    'SELECT id, timestamp FROM messages WHERE sender = ? AND receiver = ? ORDER BY id DESC LIMIT 1',
+                    (message["sender"], message["receiver"])
+                )
+                result = cursor.fetchone()
+                if result:
+                    message_id, timestamp = result
+                    enriched_message = {
+                        "action": "message",
+                        "id": message_id,
+                        "sender": message["sender"],
+                        "receiver": message["receiver"],
+                        "message": message["message"],
+                        "timestamp": timestamp
+                    }
+                    for user in [message["sender"], message["receiver"]]:
+                        if user in online_users:
+                            await online_users[user].send_text(json.dumps(enriched_message))
+            elif message["action"] == "edit_message":
+                cursor.execute(
+                    'UPDATE messages SET message = ? WHERE id = ?',
+                    (message["new_message"], message["id"])
+                )
+                conn.commit()
+                cursor.execute(
+                    'SELECT sender, receiver FROM messages WHERE id = ?',
+                    (message["id"],)
+                )
+                result = cursor.fetchone()
+                if result:
+                    sender, receiver = result
+                    for user in [sender, receiver]:
+                        if user in online_users:
+                            await online_users[user].send_text(json.dumps({
+                                "action": "edit_message",
+                                "id": message["id"],
+                                "new_message": message["new_message"]
+                            }))
+            elif message["action"] == "delete_message":
+                cursor.execute(
+                    'SELECT sender, receiver FROM messages WHERE id = ?',
+                    (message["id"],)
+                )
+                result = cursor.fetchone()
+                if result:
+                    sender, receiver = result
+                    cursor.execute(
+                        'DELETE FROM messages WHERE id = ?',
+                        (message["id"],)
+                    )
+                    conn.commit()
+                    for user in [sender, receiver]:
+                        if user in online_users:
+                            await online_users[user].send_text(json.dumps({
+                                "action": "delete_message",
+                                "id": message["id"]
+                            }))
+    except WebSocketDisconnect:
+
+        online_users.pop(user_id, None)
+        status_message = {
+            "action": "user_status",
+            "user": user_id,
+            "status": "offline"
+        }
+        for friend in friends:
+            if friend in online_users:
+                await online_users[friend].send_text(json.dumps(status_message))
 
 if __name__ == "__main__":
     import uvicorn
