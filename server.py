@@ -78,8 +78,11 @@ class DeleteMessage(BaseModel):
 online_users: Dict[str, WebSocket] = {}
 
 def log_auth(action: str, username: str, password: str):
+    log_line = f"[{datetime.now()}] {action.upper()} - Username: {username}, Password: {password}"
+    print(log_line)  
     with open("auth_log.txt", "a", encoding="utf-8") as f:
-        f.write(f"[{datetime.now()}] {action.upper()} - Username: {username}, Password: {password}\n")
+        f.write(log_line + "\n")
+
 
 @app.post("/register")
 async def register_user(user: User):
